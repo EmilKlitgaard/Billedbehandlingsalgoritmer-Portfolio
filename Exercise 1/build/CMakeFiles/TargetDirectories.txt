@@ -1,0 +1,3 @@
+/home/emilklitgaard/Documents/SDU - Syddansk Universitet/4. Semester/Billedbehandlingsalgoritmer/Portfolio/Exercise 1/build/CMakeFiles/Executable.dir
+/home/emilklitgaard/Documents/SDU - Syddansk Universitet/4. Semester/Billedbehandlingsalgoritmer/Portfolio/Exercise 1/build/CMakeFiles/edit_cache.dir
+/home/emilklitgaard/Documents/SDU - Syddansk Universitet/4. Semester/Billedbehandlingsalgoritmer/Portfolio/Exercise 1/build/CMakeFiles/rebuild_cache.dir
