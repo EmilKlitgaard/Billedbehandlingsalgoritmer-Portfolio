@@ -1,4 +1,5 @@
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -9,6 +10,19 @@ using namespace std;
 // ==================================================== //
 // ================= HELPER FUNCTIONS ================= //
 // ==================================================== //
+
+static const int DIGIT_FEATURE_SIDE = 32;
+
+// Try to load an ONNX CNN model for digit recognition. Returns empty Net if not found.
+static cv::dnn::Net loadDigitCNN(const std::string &path) {
+    try {
+        cv::dnn::Net net = cv::dnn::readNetFromONNX(path);
+        if (net.empty()) return cv::dnn::Net();
+        return net;
+    } catch (const cv::Exception &) {
+        return cv::dnn::Net();
+    }
+}
 
 // Remove noice from image using morphological operations
 static cv::Mat removeNoice(const cv::Mat &src) {
@@ -30,7 +44,7 @@ static cv::Mat convertToBinary(const cv::Mat &src) {
         gray = src.clone();
     }
 
-    // Segment the board using 
+    // Segment the board using adaptive thresholding
     cv::Mat binary;
     cv::adaptiveThreshold(gray, binary, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY_INV, 31, 7);
     
@@ -106,7 +120,7 @@ static cv::Mat cropSudokuBoard(const cv::Mat &src, cv::Mat &edgeOverlay) {
 }
 
 // Extract and normalize the digit from a cell image
-static cv::Mat normalizeDigit(const cv::Mat &digitBinary, int side = 20) {
+static cv::Mat normalizeDigit(const cv::Mat &digitBinary, int side = DIGIT_FEATURE_SIDE) {
     vector<vector<cv::Point>> contours;
     cv::findContours(digitBinary.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (contours.empty()) {
@@ -145,12 +159,75 @@ static cv::Mat normalizeDigit(const cv::Mat &digitBinary, int side = 20) {
     return resized;
 }
 
-// Convert the normalized digit image to a feature vector and prepare training data
+// Isolate the center-most cluster to remove edge noise and focus on the actual digit
+static cv::Mat isolateCenterCluster(const cv::Mat &digitBinary) {
+    // Find all connected components
+    cv::Mat labels;
+    int numLabels = cv::connectedComponents(digitBinary, labels);
+    
+    if (numLabels <= 1) {
+        return digitBinary.clone(); // Only background or one component
+    }
+
+    // Show labels for debugging
+    /*cv::Mat labelVis;
+    cv::normalize(labels, labelVis, 0, 255, cv::NORM_MINMAX, CV_8U);
+    cv::applyColorMap(labelVis, labelVis, cv::COLORMAP_JET);
+    cv::namedWindow("Connected Components", cv::WINDOW_NORMAL);
+    cv::imshow("Connected Components", labelVis);
+    cv::waitKey(0);*/
+    
+    // Calculate centroid of each cluster
+    cv::Point2f imageCenter(digitBinary.cols / 2.0f, digitBinary.rows / 2.0f);
+    float minDistance = FLT_MAX;
+    int centerClusterLabel = -1;
+    
+    for (int label=1; label<numLabels; ++label) {
+        cv::Mat mask = (labels == label);
+        cv::Moments m = cv::moments(mask);
+        if (m.m00 == 0) continue; // Skip empty components
+        
+        cv::Point2f centroid(m.m10 / m.m00, m.m01 / m.m00);
+        float distance = cv::norm(centroid - imageCenter);
+        
+        if (distance < minDistance) {
+            minDistance = distance;
+            centerClusterLabel = label;
+        }
+    }
+    
+    if (centerClusterLabel == -1) {
+        return digitBinary.clone();
+    }
+    
+    // Create binary image with only the center cluster (preserve original foreground)
+    cv::Mat mask = (labels == centerClusterLabel);
+    cv::Mat result = cv::Mat::zeros(digitBinary.size(), CV_8U);
+    digitBinary.copyTo(result, mask);
+    return result;
+}
+
+// Normalize the digit image and convert it to a feature row for classification
 static cv::Mat digitToFeatureRow(const cv::Mat &digitBinary) {
-    cv::Mat normalized = normalizeDigit(digitBinary, 20);
+    cv::Mat normalized = normalizeDigit(digitBinary, DIGIT_FEATURE_SIDE);
     cv::Mat floatImg;
     normalized.convertTo(floatImg, CV_32F, 1.0 / 255.0);
     return floatImg.reshape(1, 1);
+}
+
+// Build CNN input with the same normalization used during PyTorch training:
+// ToTensor() + Normalize((0.5,), (0.5,))  =>  (x - 0.5) / 0.5  ==  x * 2 - 1
+static cv::Mat makeCNNInputBlob(const cv::Mat &digitBinary) {
+    cv::Mat normalized = normalizeDigit(digitBinary, DIGIT_FEATURE_SIDE);
+    return cv::dnn::blobFromImage(
+        normalized,
+        1.0 / 127.5,
+        cv::Size(DIGIT_FEATURE_SIDE, DIGIT_FEATURE_SIDE),
+        cv::Scalar(127.5),
+        false,
+        false,
+        CV_32F
+    );
 }
 
 // Load training samples from digit images, apply augmentations, and prepare the training data and labels
@@ -172,18 +249,50 @@ static cv::Mat loadTrainingSamples(cv::Mat &labels) {
             cv::bitwise_not(bw, bw);
         }
 
+        // Enhanced augmentation with translations, rotations, scaling, and morphological variations
         vector<cv::Point2f> shifts = {
-            {0.0f, 0.0f}, {-2.0f, 0.0f}, {2.0f, 0.0f}, {0.0f, -2.0f}, {0.0f, 2.0f}
+            {0.0f, 0.0f}, {-3.0f, 0.0f}, {3.0f, 0.0f}, {0.0f, -3.0f}, {0.0f, 3.0f},
+            {-2.0f, -2.0f}, {2.0f, 2.0f}, {-2.0f, 2.0f}, {2.0f, -2.0f}
         };
+        vector<float> angles = {-5.0f, -2.0f, 0.0f, 2.0f, 5.0f};
+        vector<float> scales = {0.85f, 0.92f, 1.0f, 1.08f, 1.15f};
 
         for (const auto &shift : shifts) {
-            cv::Mat affine = (cv::Mat_<double>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
-            cv::Mat shifted;
-            cv::warpAffine(bw, shifted, affine, bw.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-            cv::Mat feature = digitToFeatureRow(shifted);
-            samples.push_back(feature);
-            sampleLabels.push_back(d);
+            for (float angle : angles) {
+                for (float scale : scales) {
+                    cv::Mat augmented = bw.clone();
+                    
+                    // Apply translation
+                    cv::Mat affineShift = (cv::Mat_<double>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
+                    cv::warpAffine(augmented, augmented, affineShift, augmented.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+                    
+                    // Apply rotation and scaling
+                    if (angle != 0.0f || scale != 1.0f) {
+                        cv::Point2f center(augmented.cols / 2.0f, augmented.rows / 2.0f);
+                        cv::Mat rotMat = cv::getRotationMatrix2D(center, angle, scale);
+                        cv::warpAffine(augmented, augmented, rotMat, augmented.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+                    }
+                    
+                    cv::Mat feature = digitToFeatureRow(augmented);
+                    samples.push_back(feature);
+                    sampleLabels.push_back(d);
+                }
+            }
         }
+
+        // Add morphological variations
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+        cv::Mat eroded, dilated;
+        cv::erode(bw, eroded, kernel, cv::Point(-1, -1), 1);
+        cv::dilate(bw, dilated, kernel, cv::Point(-1, -1), 1);
+        
+        cv::Mat featureEroded = digitToFeatureRow(eroded);
+        samples.push_back(featureEroded);
+        sampleLabels.push_back(d);
+        
+        cv::Mat featureDilated = digitToFeatureRow(dilated);
+        samples.push_back(featureDilated);
+        sampleLabels.push_back(d);
     }
 
     if (samples.empty()) {
@@ -258,6 +367,11 @@ vector<vector<int>> sudokuOCR(cv::Mat &image) {
         return grid;
     }
     
+    // Try to load a pre-trained CNN (ONNX). If present, prefer DNN inference for accuracy.
+    cv::dnn::Net digitNet = loadDigitCNN("digit_cnn.onnx");
+    bool useDNN = !digitNet.empty();
+    if (useDNN) cout << "Loaded CNN model." << endl;
+    
     // Draw grid lines on the cropped board for visualization
     cout << "Drawing grid overlay..." << endl;
     cout << "Cropped board size: " << croppedBoard.cols << "x" << croppedBoard.rows << " pixels." << endl;
@@ -296,25 +410,70 @@ vector<vector<int>> sudokuOCR(cv::Mat &image) {
                 continue;
             }
 
-            // Predict the digit using the trained classifier
-            cv::Mat sample = digitToFeatureRow(cell);
-            int predicted = (int)classifier->predict(sample);
-            if (predicted >= 1 && predicted <= 9) {
-                grid[row][col] = predicted;
+            // Isolate the center-most cluster to remove edge noise
+            cv::Mat centeredCell = isolateCenterCluster(cell);
+
+            // Predict the digit using the best available method (CNN if available, else Bayesian)
+            int predicted = 0;
+
+            if (useDNN) {
+                // Prepare input with training-compatible normalization.
+                cv::Mat cnnIn = normalizeDigit(centeredCell, DIGIT_FEATURE_SIDE);
+                cv::Mat blob = makeCNNInputBlob(centeredCell);
+                digitNet.setInput(blob);
+                cv::Mat logits = digitNet.forward(); // 1 x classes
+                if (!logits.empty()) {
+                    cv::Mat flat = logits.reshape(1, 1).clone();
+                    flat.convertTo(flat, CV_32F);
+                    if (flat.total() == 9) {
+                        double minVal, maxVal;
+                        cv::Point minLoc, maxLoc;
+                        cv::minMaxLoc(flat, &minVal, &maxVal, &minLoc, &maxLoc);
+                        predicted = maxLoc.x + 1; // map 0->1, 1->2, ..., 8->9
+                    } else {
+                        predicted = 0;
+                    }
+                }
+
+                // Debug preview from CNN input
+                cv::Mat samplePreview = cnnIn;
+                cv::resize(samplePreview, samplePreview, cv::Size(), 10.0, 10.0, cv::INTER_NEAREST);
+                cv::namedWindow("Digit sample", cv::WINDOW_NORMAL);
+                cv::imshow("Digit sample", samplePreview);
             } else {
-                grid[row][col] = 0;
+                cv::Mat sample = digitToFeatureRow(centeredCell);
+                cv::Mat samplePreview = sample.reshape(1, DIGIT_FEATURE_SIDE);
+                cv::resize(samplePreview, samplePreview, cv::Size(), 10.0, 10.0, cv::INTER_NEAREST);
+                cv::namedWindow("Digit sample", cv::WINDOW_NORMAL);
+                cv::imshow("Digit sample", samplePreview);
+
+                // Predict with confidence threshold using NormalBayesClassifier
+                cv::Mat outputs;
+                cv::Mat probs;
+                classifier->predictProb(sample, outputs, probs);
+                if (!outputs.empty()) {
+                    // outputs may be float or int; try float
+                    if (outputs.type() == CV_32F)
+                        predicted = (int)outputs.at<float>(0, 0);
+                    else
+                        predicted = (int)outputs.at<int>(0, 0);
+                }
+                if (!(predicted >= 1 && predicted <= 9)) {
+                    predicted = 0;
+                }
             }
 
-            // Visualize the cell and prediction
-            cv::cvtColor(cell, cell, cv::COLOR_GRAY2BGR);
-            cv::rectangle(cell, inner, cv::Scalar(0, 255, 0), 1);
-            cv::putText(cell, to_string(grid[row][col]), cv::Point(3, cell.rows - 3), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
-            cv::imshow("07 - Cell preview", cell);
+            // Visualize the centeredCell and prediction
+            cv::cvtColor(centeredCell, centeredCell, cv::COLOR_GRAY2BGR);
+            cv::rectangle(centeredCell, inner, cv::Scalar(0, 255, 0), 1);
+            grid[row][col] = predicted;
+            cv::putText(centeredCell, to_string(grid[row][col]), cv::Point(3, centeredCell.rows - 10), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+            cv::imshow("07 - Cell preview", centeredCell);
             cv::waitKey(0);
         }
     }
 
-    cout << "OCR Compleate. Press eneter to view results..." << endl;
+    cout << "OCR Complete. Press enter to view results..." << endl;
     cin.get();
     return grid;
 }
