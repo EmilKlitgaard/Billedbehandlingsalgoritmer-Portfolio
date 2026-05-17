@@ -1,8 +1,10 @@
 #include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp>
+#include <opencv2/ml.hpp>
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <cmath>
+#include <cfloat>
 
 using namespace std;
 
@@ -11,21 +13,17 @@ using namespace std;
 // ================= HELPER FUNCTIONS ================= //
 // ==================================================== //
 
-static const int DIGIT_FEATURE_SIDE = 64;
+static const int DIGIT_FEATURE_SIDE = 30;
 
-// Try to load an ONNX CNN model for digit recognition. Returns empty Net if not found.
-static cv::dnn::Net loadDigitCNN(const std::string &path) {
-    try {
-        cv::dnn::Net net = cv::dnn::readNetFromONNX(path);
-        if (net.empty()) return cv::dnn::Net();
-        return net;
-    } catch (const cv::Exception &) {
-        return cv::dnn::Net();
-    }
+// Helper function to display the board.
+static void showBoard(const string &name, const cv::Mat &board) {
+    cv::namedWindow(name, cv::WINDOW_NORMAL);
+    cv::imshow(name, board);
+    cv::waitKey(0);
 }
 
-// Remove noice from image using morphological operations
-static cv::Mat removeNoice(const cv::Mat &src) {
+// Remove noise from a binary image using morphological operations.
+static cv::Mat removeNoise(const cv::Mat &src) {
     cv::Mat cleanedBoard;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
     cv::morphologyEx(src, cleanedBoard, cv::MORPH_OPEN, kernel);
@@ -51,29 +49,36 @@ static cv::Mat convertToBinary(const cv::Mat &src) {
     return binary;
 }
 
-// Order the corners of the detected rectangle
-static vector<cv::Point2f> orderCorners(const vector<cv::Point2f> &corners) {
-    vector<cv::Point2f> ordered(4);
-    vector<float> sums, diffs;
-    for (const auto &corner : corners) {
-        sums.push_back(corner.x + corner.y);
-        diffs.push_back(corner.y - corner.x);
-    }
+// Draw a red grid overlay on the cropped board for visualization
+static cv::Mat drawGridOverlay(const cv::Mat &croppedBoard) {
+    cout << "Drawing grid overlay..." << endl;
+    cout << "Cropped board size: " << croppedBoard.cols << "x" << croppedBoard.rows << " pixels." << endl;
+    int cellW = croppedBoard.cols / 9;
+    int cellH = croppedBoard.rows / 9;
 
-    ordered[0] = corners[min_element(sums.begin(), sums.end()) - sums.begin()]; // top-left
-    ordered[2] = corners[max_element(sums.begin(), sums.end()) - sums.begin()]; // bottom-right
-    ordered[1] = corners[min_element(diffs.begin(), diffs.end()) - diffs.begin()]; // top-right
-    ordered[3] = corners[max_element(diffs.begin(), diffs.end()) - diffs.begin()]; // bottom-left
-    return ordered;
+    // If croppedBoard is binary, convert to color for visualization
+    cv::Mat gridOverlayBoard = croppedBoard.clone();
+    if (gridOverlayBoard.channels() == 1) {
+        cv::cvtColor(gridOverlayBoard, gridOverlayBoard, cv::COLOR_GRAY2BGR);
+    }
+    
+    for (int i = 1; i < 9; ++i) {
+        cv::Scalar color = cv::Scalar(0, 0, 255);
+        int lineWidth = 3;
+        int x = i * cellW;
+        int y = i * cellH;
+        cv::line(gridOverlayBoard, cv::Point(x, 0), cv::Point(x, croppedBoard.rows - 1), color, lineWidth);
+        cv::line(gridOverlayBoard, cv::Point(0, y), cv::Point(croppedBoard.cols - 1, y), color, lineWidth);
+    }
+    return gridOverlayBoard;
 }
 
-// Detect and crop the sudoku board
-static cv::Mat cropSudokuBoard(const cv::Mat &src, cv::Mat &edgeOverlay) {
-    cv::Mat binary = convertToBinary(src);
-
+// Detect and crop the sudoku board from a cleaned binary mask.
+static cv::Mat cropSudokuBoard(const cv::Mat &src, cv::Mat &binaryMask, cv::Mat &edgeOverlay) {
     vector<vector<cv::Point>> contours;
-    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(binaryMask.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
+    // Find the largest rectangular contour
     vector<cv::Point2f> bestCorners;
     double bestArea = 0.0;
     for (const auto &contour : contours) {
@@ -92,20 +97,48 @@ static cv::Mat cropSudokuBoard(const cv::Mat &src, cv::Mat &edgeOverlay) {
         }
     }
 
-    if (bestCorners.size() != 4) {
-        cout << "Error: Could not find a rectangular sudoku board." << endl;
+    // If no corners were found, return the original image
+    if (bestCorners.empty()) {
         return src.clone();
     }
 
-    vector<cv::Point2f> orderedCorners = orderCorners(bestCorners);
+    // Use RotatedRect for cleaner corner manipulation
+    vector<cv::Point> contourPoints;
+    for (const auto& pt : bestCorners) {
+        contourPoints.push_back(cv::Point((int)pt.x, (int)pt.y));
+    }
+    cv::RotatedRect boardRect = cv::minAreaRect(contourPoints);
+    
+    // Shrink the rectangle by inset amount
+    const int INSET = 8;
+    boardRect.size.width = max(1.0f, boardRect.size.width - 2 * INSET);
+    boardRect.size.height = max(1.0f, boardRect.size.height - 2 * INSET);
+    
+    // Get the inset corners
+    cv::Point2f rectCorners[4];
+    boardRect.points(rectCorners);
+    
+    // Convert to vector for consistency
+    vector<cv::Point2f> orderedCorners(rectCorners, rectCorners + 4);
+    
+    // Sort corners: top-left, top-right, bottom-right, bottom-left
+    cv::Point2f center = boardRect.center;
+    sort(orderedCorners.begin(), orderedCorners.end(), [&center](const cv::Point2f& a, const cv::Point2f& b) {
+        float angleA = atan2(a.y - center.y, a.x - center.x);
+        float angleB = atan2(b.y - center.y, b.x - center.x);
+        return angleA < angleB;
+    });
 
-    // Draw detected contour lines on the edge overlay for visualization
+    // Draw the inset board outline on the overlay for visualization
     edgeOverlay = src.clone();
-    for (int i=0; i<orderedCorners.size(); ++i) {
-        cv::line(edgeOverlay, orderedCorners[i], orderedCorners[(i + 1) % orderedCorners.size()], cv::Scalar(0, 0, 255), 3);
+    for (int i = 0; i < 4; ++i) {
+        cv::line(edgeOverlay, orderedCorners[i], orderedCorners[(i + 1) % 4], cv::Scalar(0, 0, 255), 3);
     }
 
-    int side = (int)sqrt(bestArea);
+    // Compute output size
+    float maxDim = max(boardRect.size.width, boardRect.size.height);
+    int side = max(1, (int)round(maxDim));
+
     vector<cv::Point2f> dstPts = {
         cv::Point2f(0.0f, 0.0f),
         cv::Point2f((float)side, 0.0f),
@@ -115,7 +148,7 @@ static cv::Mat cropSudokuBoard(const cv::Mat &src, cv::Mat &edgeOverlay) {
 
     cv::Mat transform = cv::getPerspectiveTransform(orderedCorners, dstPts);
     cv::Mat cropped;
-    cv::warpPerspective(src, cropped, transform, cv::Size(side, side));
+    cv::warpPerspective(binaryMask, cropped, transform, cv::Size(side, side));
     return cropped;
 }
 
@@ -168,14 +201,6 @@ static cv::Mat isolateCenterCluster(const cv::Mat &digitBinary) {
     if (numLabels <= 1) {
         return digitBinary.clone(); // Only background or one component
     }
-
-    // Show labels for debugging
-    /*cv::Mat labelVis;
-    cv::normalize(labels, labelVis, 0, 255, cv::NORM_MINMAX, CV_8U);
-    cv::applyColorMap(labelVis, labelVis, cv::COLORMAP_JET);
-    cv::namedWindow("Connected Components", cv::WINDOW_NORMAL);
-    cv::imshow("Connected Components", labelVis);
-    cv::waitKey(0);*/
     
     // Calculate centroid of each cluster
     cv::Point2f imageCenter(digitBinary.cols / 2.0f, digitBinary.rows / 2.0f);
@@ -215,28 +240,13 @@ static cv::Mat digitToFeatureRow(const cv::Mat &digitBinary) {
     return floatImg.reshape(1, 1);
 }
 
-// Build CNN input with the same normalization used during PyTorch training:
-// ToTensor() + Normalize((0.5,), (0.5,))  =>  (x - 0.5) / 0.5  ==  x * 2 - 1
-static cv::Mat makeCNNInputBlob(const cv::Mat &digitBinary) {
-    cv::Mat normalized = normalizeDigit(digitBinary, DIGIT_FEATURE_SIDE);
-    return cv::dnn::blobFromImage(
-        normalized,
-        1.0 / 127.5,
-        cv::Size(DIGIT_FEATURE_SIDE, DIGIT_FEATURE_SIDE),
-        cv::Scalar(127.5),
-        false,
-        false,
-        CV_32F
-    );
-}
-
-// Load training samples from digit images, apply augmentations, and prepare the training data and labels
+// Load training samples from digit images and prepare the training data and labels.
 static cv::Mat loadTrainingSamples(cv::Mat &labels) {
     vector<cv::Mat> samples;
     vector<int> sampleLabels;
 
-    for (int d = 1; d <= 9; ++d) {
-        string path = "numbers/" + to_string(d) + ".png";
+    for (int digit=1; digit<=9; ++digit) {
+        string path = "numbers/" + to_string(digit) + ".png";
         cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
         if (img.empty()) {
             cout << "Warning: could not load training digit from " << path << endl;
@@ -249,50 +259,9 @@ static cv::Mat loadTrainingSamples(cv::Mat &labels) {
             cv::bitwise_not(bw, bw);
         }
 
-        // Enhanced augmentation with translations, rotations, scaling, and morphological variations
-        vector<cv::Point2f> shifts = {
-            {0.0f, 0.0f}, {-3.0f, 0.0f}, {3.0f, 0.0f}, {0.0f, -3.0f}, {0.0f, 3.0f},
-            {-2.0f, -2.0f}, {2.0f, 2.0f}, {-2.0f, 2.0f}, {2.0f, -2.0f}
-        };
-        vector<float> angles = {-5.0f, -2.0f, 0.0f, 2.0f, 5.0f};
-        vector<float> scales = {0.85f, 0.92f, 1.0f, 1.08f, 1.15f};
-
-        for (const auto &shift : shifts) {
-            for (float angle : angles) {
-                for (float scale : scales) {
-                    cv::Mat augmented = bw.clone();
-                    
-                    // Apply translation
-                    cv::Mat affineShift = (cv::Mat_<double>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
-                    cv::warpAffine(augmented, augmented, affineShift, augmented.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-                    
-                    // Apply rotation and scaling
-                    if (angle != 0.0f || scale != 1.0f) {
-                        cv::Point2f center(augmented.cols / 2.0f, augmented.rows / 2.0f);
-                        cv::Mat rotMat = cv::getRotationMatrix2D(center, angle, scale);
-                        cv::warpAffine(augmented, augmented, rotMat, augmented.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-                    }
-                    
-                    cv::Mat feature = digitToFeatureRow(augmented);
-                    samples.push_back(feature);
-                    sampleLabels.push_back(d);
-                }
-            }
-        }
-
-        // Add morphological variations
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-        cv::Mat eroded, dilated;
-        cv::erode(bw, eroded, kernel, cv::Point(-1, -1), 1);
-        cv::dilate(bw, dilated, kernel, cv::Point(-1, -1), 1);
-        
-        cv::Mat featureEroded = digitToFeatureRow(eroded);
-        samples.push_back(featureEroded);
-        sampleLabels.push_back(d);
-        
-        cv::Mat featureDilated = digitToFeatureRow(dilated);
-        samples.push_back(featureDilated);
-        sampleLabels.push_back(d);
+        cv::Mat feature = digitToFeatureRow(bw);
+        samples.push_back(feature);
+        sampleLabels.push_back(digit);
     }
 
     if (samples.empty()) {
@@ -301,12 +270,12 @@ static cv::Mat loadTrainingSamples(cv::Mat &labels) {
     }
 
     cv::Mat trainData((int)samples.size(), samples[0].cols, CV_32F);
-    for (int i = 0; i < (int)samples.size(); ++i) {
+    for (int i=0; i<(int)samples.size(); ++i) {
         samples[i].copyTo(trainData.row(i));
     }
 
     labels = cv::Mat((int)sampleLabels.size(), 1, CV_32S);
-    for (int i = 0; i < (int)sampleLabels.size(); ++i) {
+    for (int i=0; i<(int)sampleLabels.size(); ++i) {
         labels.at<int>(i, 0) = sampleLabels[i];
     }
 
@@ -318,10 +287,15 @@ static cv::Ptr<cv::ml::NormalBayesClassifier> trainClassifier() {
     cv::Mat labels;
     cv::Mat trainData = loadTrainingSamples(labels);
 
-    cv::Ptr<cv::ml::NormalBayesClassifier> classifier = cv::ml::NormalBayesClassifier::create();
-    if (!trainData.empty()) {
-        classifier->train(trainData, cv::ml::ROW_SAMPLE, labels);
+    if (trainData.empty() || labels.empty()) {
+        return cv::Ptr<cv::ml::NormalBayesClassifier>();
     }
+
+    cv::Ptr<cv::ml::NormalBayesClassifier> classifier = cv::ml::NormalBayesClassifier::create();
+    if (!classifier->train(trainData, cv::ml::ROW_SAMPLE, labels)) {
+        return cv::Ptr<cv::ml::NormalBayesClassifier>();
+    }
+
     return classifier;
 }
 
@@ -331,72 +305,44 @@ static cv::Ptr<cv::ml::NormalBayesClassifier> trainClassifier() {
 // ===================================================== //
 
 vector<vector<int>> sudokuOCR(cv::Mat &image) {
-    cout << "Running OCR on image..." << endl;
-    vector<vector<int>> grid(9, vector<int>(9, 0));
-
-    if (image.empty()) {
-        cout << "Input image is empty." << endl;
-        return grid;
-    }
-
-    cv::namedWindow("01 - Input image", cv::WINDOW_NORMAL);
-    cv::imshow("01 - Input image", image);
-
-    // Remove noice from the input image using morphological operations
-    cv::Mat cleanedBoard = removeNoice(image);
-    cv::namedWindow("02 - Cleaned board", cv::WINDOW_NORMAL);
-    cv::imshow("02 - Cleaned board", cleanedBoard);
-
-    // Detect board edges and crop to top-down view
-    cv::Mat boardEdgeContour;
-    cv::Mat croppedBoard = cropSudokuBoard(cleanedBoard, boardEdgeContour);
-    cv::namedWindow("03 - Board edge contour", cv::WINDOW_NORMAL);
-    cv::imshow("03 - Board edge contour", boardEdgeContour);
-    cv::namedWindow("04 - Cropped board", cv::WINDOW_NORMAL);
-    cv::imshow("04 - Cropped board", croppedBoard);
-
-    // Convert cropped board to binary
-    cv::Mat binaryBoard = convertToBinary(croppedBoard);
-    cv::namedWindow("05 - Binary board", cv::WINDOW_NORMAL);
-    cv::imshow("05 - Binary board", binaryBoard);
-
     // Load training data and train the classifier
+    cout << "Loading training data and training classifier..." << endl;
     cv::Ptr<cv::ml::NormalBayesClassifier> classifier = trainClassifier();
+    vector<vector<int>> grid(9, vector<int>(9, 0));
     if (classifier.empty()) {
         cout << "Training failed: no digit samples were loaded." << endl;
         return grid;
     }
-    
-    // Try to load a pre-trained CNN (ONNX). If present, prefer DNN inference for accuracy.
-    cv::dnn::Net digitNet = loadDigitCNN("digit_cnn.onnx");
-    bool useDNN = !digitNet.empty();
-    if (useDNN) cout << "Loaded CNN model." << endl;
-    
-    // Draw grid lines on the cropped board for visualization
-    cout << "Drawing grid overlay..." << endl;
-    cout << "Cropped board size: " << croppedBoard.cols << "x" << croppedBoard.rows << " pixels." << endl;
+    cout << "Training complete. Starting OCR process..." << endl;
+
+    // Display the original input image
+    showBoard("01 - Input image", image);
+
+    // Convert to binary first, then clean noise in the binary domain.
+    cv::Mat binaryImage = convertToBinary(image);
+    showBoard("02 - Binary board", binaryImage);
+    cv::Mat cleanedBoard = removeNoise(binaryImage);
+    showBoard("03 - Cleaned board", cleanedBoard);
+
+    // Detect board edges and crop to a top-down view.
+    cv::Mat boardEdgeContour;
+    cv::Mat croppedBoard = cropSudokuBoard(image, cleanedBoard, boardEdgeContour);
+    showBoard("04 - Board edge contour", boardEdgeContour);
+    showBoard("05 - Cropped board", croppedBoard);
+
+    // Draw a grid overlay on the cropped board for visualization.
+    cv::Mat gridOverlayBoard = drawGridOverlay(croppedBoard);
+    showBoard("06 - Grid overlay", gridOverlayBoard);
+
+    // Extract each cell, check for digit presence, and classify using the trained classifier.
+    cout << "Extracting and classifying digits..." << endl;
     int cellW = croppedBoard.cols / 9;
     int cellH = croppedBoard.rows / 9;
-    cv::Mat gridOverlayBoard = croppedBoard.clone();
-    for (int i = 1; i < 9; ++i) {
-        cv::Scalar color = cv::Scalar(0, 0, 255);
-        int lineWidth = 3;
-        int x = i * cellW;
-        int y = i * cellH;
-        cv::line(gridOverlayBoard, cv::Point(x, 0), cv::Point(x, croppedBoard.rows - 1), color, lineWidth);
-        cv::line(gridOverlayBoard, cv::Point(0, y), cv::Point(croppedBoard.cols - 1, y), color, lineWidth);
-    }
-    cv::namedWindow("06 - Grid overlay", cv::WINDOW_NORMAL);
-    cv::imshow("06 - Grid overlay", gridOverlayBoard);
-    
-    // Extract each cell, check for digit presence, and classify using the trained classifier
-    cout << "Extracting and classifying digits..." << endl;
-    cv::namedWindow("07 - Cell preview", cv::WINDOW_NORMAL);
     for (int row = 0; row < 9; ++row) {
         for (int col = 0; col < 9; ++col) {
             // Extract the cell region from the binary board
             cv::Rect cellRect(col * cellW, row * cellH, cellW, cellH);
-            cv::Mat cell = binaryBoard(cellRect).clone();
+            cv::Mat cell = croppedBoard(cellRect).clone();
 
             // Define an inner region to check for digit presence, avoiding borders
             int borderX = max(1, cell.cols / 5);
@@ -413,63 +359,25 @@ vector<vector<int>> sudokuOCR(cv::Mat &image) {
             // Isolate the center-most cluster to remove edge noise
             cv::Mat centeredCell = isolateCenterCluster(cell);
 
-            // Predict the digit using the best available method (CNN if available, else Bayesian)
+            // Predict the digit using the trained Bayesian classifier.
             int predicted = 0;
 
-            if (useDNN) {
-                // Prepare input with training-compatible normalization.
-                cv::Mat cnnIn = normalizeDigit(centeredCell, DIGIT_FEATURE_SIDE);
-                cv::Mat blob = makeCNNInputBlob(centeredCell);
-                digitNet.setInput(blob);
-                cv::Mat logits = digitNet.forward(); // 1 x classes
-                if (!logits.empty()) {
-                    cv::Mat flat = logits.reshape(1, 1).clone();
-                    flat.convertTo(flat, CV_32F);
-                    if (flat.total() == 9) {
-                        double minVal, maxVal;
-                        cv::Point minLoc, maxLoc;
-                        cv::minMaxLoc(flat, &minVal, &maxVal, &minLoc, &maxLoc);
-                        predicted = maxLoc.x + 1; // map 0->1, 1->2, ..., 8->9
-                    } else {
-                        predicted = 0;
-                    }
-                }
+            cv::Mat sample = digitToFeatureRow(centeredCell);
+            predicted = classifier->predict(sample);
 
-                // Debug preview from CNN input
-                cv::Mat samplePreview = cnnIn;
-                cv::resize(samplePreview, samplePreview, cv::Size(), 10.0, 10.0, cv::INTER_NEAREST);
-                cv::namedWindow("Digit sample", cv::WINDOW_NORMAL);
-                cv::imshow("Digit sample", samplePreview);
-            } else {
-                cv::Mat sample = digitToFeatureRow(centeredCell);
-                cv::Mat samplePreview = sample.reshape(1, DIGIT_FEATURE_SIDE);
-                cv::resize(samplePreview, samplePreview, cv::Size(), 10.0, 10.0, cv::INTER_NEAREST);
-                cv::namedWindow("Digit sample", cv::WINDOW_NORMAL);
-                cv::imshow("Digit sample", samplePreview);
-
-                // Predict with confidence threshold using NormalBayesClassifier
-                cv::Mat outputs;
-                cv::Mat probs;
-                classifier->predictProb(sample, outputs, probs);
-                if (!outputs.empty()) {
-                    // outputs may be float or int; try float
-                    if (outputs.type() == CV_32F)
-                        predicted = (int)outputs.at<float>(0, 0);
-                    else
-                        predicted = (int)outputs.at<int>(0, 0);
-                }
-                if (!(predicted >= 1 && predicted <= 9)) {
-                    predicted = 0;
-                }
+            // Only accept predictions in the valid digit range (1-9)
+            if (!(predicted >= 1 && predicted <= 9)) {
+                continue;
             }
 
-            // Visualize the centeredCell and prediction
-            cv::cvtColor(centeredCell, centeredCell, cv::COLOR_GRAY2BGR);
-            cv::rectangle(centeredCell, inner, cv::Scalar(0, 255, 0), 1);
+            // Display the cell with the predicted digit for visualization
+            cv::Mat cellPreview;
+            cv::cvtColor(centeredCell, cellPreview, cv::COLOR_GRAY2BGR);
+            cv::rectangle(cellPreview, inner, cv::Scalar(0, 255, 0), 1);
+            cv::putText(cellPreview, to_string(predicted), cv::Point(3, cellPreview.rows - 5), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+            showBoard("07 - Cell preview", cellPreview);
+
             grid[row][col] = predicted;
-            cv::putText(centeredCell, to_string(grid[row][col]), cv::Point(3, centeredCell.rows - 10), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
-            cv::imshow("07 - Cell preview", centeredCell);
-            cv::waitKey(0);
         }
     }
 
@@ -477,7 +385,6 @@ vector<vector<int>> sudokuOCR(cv::Mat &image) {
     cin.get();
     return grid;
 }
-
 
 // =================================================== //
 // ========== ORIGINAL ASSIGNMENT FUNCTIONS ========== //

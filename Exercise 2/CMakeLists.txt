@@ -13,5 +13,5 @@ add_executable(Executable main.cpp)
 # Output executable to parent directory
 set_target_properties(Executable PROPERTIES RUNTIME_OUTPUT_DIRECTORY "..")
 
-# Link against the installed UR RTDE library
+# Link against OpenCV
 target_link_libraries(Executable ${OpenCV_LIBS})
